@@ -25,7 +25,7 @@ If you used this code in your research or found it helpful, please consider citi
 - numpy: 1.19.5
 - tdqm
 
-### Molecule discovery
+### Sequence
 Please check the [BioSeq-GFN-AL](https://github.com/MJ10/BioSeq-GFN-AL) repo for more details about the environment.
 
 ## Usage
