@@ -31,9 +31,11 @@ Please check the [BioSeq-GFN-AL](https://github.com/MJ10/BioSeq-GFN-AL) repo for
 ## Usage
 
 Please follow the instructions below to replicate the results in the paper. 
+- Grid (in the grid folder)
 ```
 python main.py --stick <STICK> --horizon <HORIZON> --seed <SEED>
 ```
+- Sequence (in the tfb folder)
 ```
 python run_tfbind.py --stick <STICK> --seed <SEED>
 ```
