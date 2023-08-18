@@ -1,0 +1,444 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+import numpy as np
+import hydra
+from lib.utils.tokenizers import str_to_tokens, tokens_to_str, str_to_tokens_pad_max_len
+
+from lib.model.mlp import MLP
+
+import copy
+
+class DropoutRegressor(nn.Module):
+    def __init__(self, args, tokenizer):
+        super().__init__()
+        self.args = args
+        self.num_tokens = args.vocab_size
+        self.max_len = args.max_len
+
+        self.tokenizer = tokenizer
+        
+        self.init_model()
+        
+        self.sigmoid = nn.Sigmoid()
+        
+        self.proxy_num_iterations = args.proxy_num_iterations
+        
+        self.device = args.device
+
+        # not used
+        if args.task == "amp":
+            self.eos_tok = 0
+        elif args.task == "tfbind":
+            self.eos_tok = 4
+        # not used
+
+    def init_model(self):
+        if self.args.proxy_arch == "mlp":
+            self.model = MLP(
+                num_tokens=self.num_tokens,
+                num_outputs=1,
+                num_hid=self.args.proxy_num_hid,
+                num_layers=self.args.proxy_num_layers, # TODO: add these as hyperparameters?
+                dropout=self.args.proxy_dropout,
+                max_len=self.max_len
+            )
+        self.model.to(self.args.device)
+
+        if self.args.proxy_betas != '':
+            betas = tuple([float(b) for b in self.args.proxy_betas.split(',')])
+            self.opt = torch.optim.Adam(self.model.parameters(), self.args.proxy_learning_rate, weight_decay=self.args.proxy_L2, betas=betas)
+        else:
+            self.opt = torch.optim.Adam(self.model.parameters(), self.args.proxy_learning_rate, weight_decay=self.args.proxy_L2)
+
+    def fit(self, data, reset=False):
+        losses = []
+        test_losses = []
+        best_params = None
+        best_loss = 1e6
+        early_stop_tol = self.args.proxy_early_stop_tol
+        early_stop_count = 0
+        epoch_length = 100
+        if reset:
+            self.init_model()
+
+        for it in tqdm(range(self.proxy_num_iterations), disable=False):
+            x, y = data.sample(self.args.proxy_num_per_minibatch)
+
+            x = self.tokenizer.process(x).to(self.device)
+            if self.args.proxy_arch == "mlp":
+                inp_x = F.one_hot(x, num_classes=self.num_tokens + 1)[:, :, :-1].to(torch.float32)
+                inp = torch.zeros(x.shape[0], self.max_len, self.num_tokens)
+                inp[:, :inp_x.shape[1], :] = inp_x
+                x = inp.reshape(x.shape[0], -1).to(self.device).detach()
+            
+            y = torch.tensor(y, device=self.device, dtype=torch.float).reshape(-1)
+            
+            if self.args.proxy_arch == "mlp":
+                output = self.model(x, None).squeeze(1)
+            
+            loss = (output - y).pow(2).mean()
+            
+            loss.backward()
+            self.opt.step()
+            self.opt.zero_grad()
+            
+            losses.append(loss.item())
+            self.args.logger.add_scalar("proxy_train_loss", loss.item())
+            
+            if not it % epoch_length:
+                vx, vy = data.validation_set()
+                vlosses = []
+                for j in range(len(vx) // 256):
+                    x = self.tokenizer.process(vx[j * 256 : (j + 1) * 256]).to(self.device)
+                    if self.args.proxy_arch == "mlp":
+                        inp_x = F.one_hot(x, num_classes=self.num_tokens + 1)[:, :, :-1].to(torch.float32)
+                        inp = torch.zeros(x.shape[0], self.max_len, self.num_tokens)
+                        inp[:, :inp_x.shape[1], :] = inp_x
+                        x = inp.reshape(x.shape[0], -1).to(self.device).detach()
+
+                    y = torch.tensor(vy[j * 256 : (j + 1) * 256], device=self.device, dtype=torch.float).reshape(-1)
+                    
+                    if self.args.proxy_arch == "mlp":
+                        output = self.model(x, None).squeeze(1)
+                    
+                    loss = (output -  y).pow(2)
+                    
+                    vlosses.append(loss.sum().item())
+
+                test_loss = np.sum(vlosses) / len(vx)
+                test_losses.append(test_loss)
+                self.args.logger.add_scalar("proxy_test_loss", test_loss)
+                if test_loss < best_loss:
+                    best_loss = test_loss
+                    best_params = [i.data.cpu().numpy() for i in self.model.parameters()]
+                    early_stop_count = 0
+                else:
+                    early_stop_count += 1
+
+                if early_stop_count >= early_stop_tol:
+                    print(best_loss)
+                    print('early stopping')
+                    break
+
+        if self.args.proxy_early_stop_to_best_params:
+            # Put best parameters back in
+            for i, besti in zip(self.model.parameters(), best_params):
+                i.data = torch.tensor(besti).to(self.device)
+        self.args.logger.save(self.args.save_path, self.args)
+        return {}
+
+    def forward(self, curr_x, uncertainty_call=False):
+        x = self.tokenizer.process(curr_x).to(self.device)
+        if self.args.proxy_arch == "mlp":
+            inp_x = F.one_hot(x, num_classes=self.num_tokens+1)[:, :, :-1].to(torch.float32)
+            inp = torch.zeros(x.shape[0], self.max_len, self.num_tokens)
+            inp[:, :inp_x.shape[1], :] = inp_x
+            x = inp.reshape(x.shape[0], -1).to(self.device).detach()
+        if uncertainty_call:
+            if self.args.proxy_arch == "mlp":
+                ys = self.model(x, None).unsqueeze(0)
+        else:
+            self.model.eval()
+            if self.args.proxy_arch == "mlp":
+                ys = self.model(x, None)
+            self.model.train()
+        return ys
+    
+    def forward_with_uncertainty(self, x):
+        self.model.train()
+        with torch.no_grad():
+            outputs = torch.cat([self.forward(x, True) for _ in range(self.args.proxy_num_dropout_samples)])
+        return outputs.mean(dim=0), outputs.std(dim=0)
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path):
+        self.load_state_dict(path)
+
+
+class EnsembleRegressor(nn.Module):
+    def __init__(self, args, tokenizer):
+        super().__init__()
+        self.args = args
+        self.num_tokens = args.vocab_size
+        self.max_len = args.max_len
+        self.tokenizer = tokenizer
+        self.init_model()
+
+        self.sigmoid = nn.Sigmoid()
+        self.proxy_num_iterations = args.proxy_num_iterations
+        
+        self.device = args.device
+        if args.task == "amp":
+            self.eos_tok = 0
+        elif args.task == "tfbind":
+            self.eos_tok = 4
+
+    def init_model(self):
+        if self.args.proxy_arch == "mlp":
+            self.models = [MLP(num_tokens=self.num_tokens,
+                                num_outputs=1,
+                                num_hid=self.args.proxy_num_hid,
+                                num_layers=self.args.proxy_num_layers,
+                                dropout=self.args.proxy_dropout,
+                                max_len=self.max_len) for i in range(self.args.proxy_num_dropout_samples)]
+        [model.to(self.args.device) for model in self.models]
+        self.params = sum([list(model.parameters()) for model in self.models], [])
+        self.opt = torch.optim.Adam(self.params, self.args.proxy_learning_rate,
+                            weight_decay=self.args.proxy_L2)
+
+    def fit(self, data, reset=False):
+        losses = []
+        test_losses = []
+        best_params = None
+        best_loss = 1e6
+        early_stop_tol = 100
+        early_stop_count = 0
+        epoch_length = 100
+        if reset:
+            self.init_model()
+
+        for it in range(self.proxy_num_iterations):
+            x, y = data.sample(self.args.proxy_num_per_minibatch)
+            x = self.tokenizer.process(x).to(self.device)
+            y = torch.tensor(y, device=self.device, dtype=torch.float).reshape(-1)
+            if self.args.proxy_arch == "mlp":
+                output = self._call_models(x).mean(0)
+            loss = (output - y).pow(2).mean()
+            loss.backward()
+            self.opt.step()
+            self.opt.zero_grad()
+            
+            losses.append(loss.item())
+            self.args.logger.add_scalar("proxy_train_loss", loss.item())
+            
+
+            if not it % epoch_length:
+                vx, vy = data.validation_set()
+                vlosses = []
+                for j in range(len(vx) // 256):
+                    x = self.tokenizer.process(vx[j*256:(j+1)*256]).to(self.device)
+                    y = torch.tensor(vy[j*256:(j+1)*256], device=self.device, dtype=torch.float).reshape(-1)
+                    if self.args.proxy_arch == "mlp":
+                        output = self._call_models(x).mean(0)
+                    
+                    loss = (output -  y).pow(2)
+                    vlosses.append(loss.sum().item())
+
+                test_loss = np.sum(vlosses) / len(vx)
+                test_losses.append(test_loss)
+                self.args.logger.add_scalar("proxy_test_loss", test_loss)
+                if test_loss < best_loss:
+                    best_loss = test_loss
+                    best_params = [[i.data.cpu().numpy() for i in model.parameters()] for model in self.models]
+                    early_stop_count = 0
+                else:
+                    early_stop_count += 1
+
+                if early_stop_count >= early_stop_tol:
+                    print(best_loss)
+                    print('early stopping')
+                    break
+
+        if self.args.proxy_early_stop_to_best_params:
+            # Put best parameters back in
+            for i, model in enumerate(self.models):
+                for i, besti in zip(model.parameters(), best_params[i]):
+                    i.data = torch.tensor(besti).to(self.device)
+        self.args.logger.save(self.args.save_path, self.args)
+        return {}
+    
+    def _call_models(self, x):
+        x = self.tokenizer.process(x).to(self.device)
+        if self.args.proxy_arch == "mlp":
+            inp_x = F.one_hot(x, num_classes=self.num_tokens+1)[:, :, :-1].to(torch.float32)
+            inp = torch.zeros(x.shape[0], self.max_len, self.num_tokens)
+            inp[:, :inp_x.shape[1], :] = inp_x
+            x = inp.reshape(x.shape[0], -1).to(self.device).detach()
+        if self.args.proxy_arch == "mlp":
+            ys = torch.cat([model(x, None).unsqueeze(0) for model in self.models])
+        return ys
+    
+    def forward_with_uncertainty(self, x):
+        with torch.no_grad():
+            outputs = self._call_models(x)
+        return outputs.mean(dim=0), outputs.std(dim=0)
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path):
+        self.load_state_dict(path)
+
+
+class TransformerDropout(nn.Module):
+    def __init__(self, args, tokenizer, device, **kwargs):
+        super().__init__()
+        self.args = args
+        self.device = device
+        self.max_len = args.max_len
+        self.tokenizer = tokenizer
+        self.sigmoid = nn.Sigmoid()
+        self.proxy_num_iterations = args.train_steps
+        self.classification = kwargs["classification"]
+        self.model = hydra.utils.instantiate(args.model)
+        self.model.to(self.device)
+        self.opt = torch.optim.Adam(self.model.parameters(), self.args.learning_rate, weight_decay=self.args.L2)
+
+        # self.all_to_pads = {}
+        # for to_pad_len in range(62):
+        #     to_pad = torch.zeros(16, to_pad_len).int().to(self.device)
+        #     self.all_to_pads[to_pad_len] = to_pad
+
+    def fit(self, data, reset=False):
+        losses = []
+        test_losses = []
+        best_params = None
+        best_loss = 1e6
+        early_stop_tol = self.args.early_stop_tol
+        early_stop_count = 0
+        epoch_length = 100
+        if reset:
+            self.init_model()
+    
+        for it in tqdm(range(self.proxy_num_iterations)):
+            x, y = data.sample(self.args.batch_size)
+
+            # x_lens = [len(xx) for xx in x]
+            # print (it, max(x_lens), x_lens)
+
+            x = str_to_tokens(x, self.tokenizer).to(self.device).t()
+            # print (x_max_len, x.shape, self.args.batch_size)
+
+            y = torch.tensor(y, device=self.device, dtype=torch.float).reshape(-1)
+            # try: 
+            output = self.model(x, None).squeeze(1)
+            # except:
+                # import pdb; pdb.set_trace();
+            if self.classification:
+                probs = self.sigmoid(output)
+                nll = -torch.log(probs) * y - torch.log(1 - probs) * (1 - y)
+                loss = nll.mean()
+            else:
+                # regression
+                loss = (output - y).pow(2).mean()
+            loss.backward()
+            self.opt.step()
+            self.opt.zero_grad()
+            
+            losses.append(loss.item())
+            # self.args.logger.add_scalar("proxy_train_loss", loss.item())
+            
+            if not it % epoch_length:
+                vx, vy = data.validation_set()
+                vlosses = []
+                acc = []
+                for j in range(len(vx) // 256):
+                    x = str_to_tokens(vx[j * 256 : (j + 1) * 256], self.tokenizer).to(self.device).t()
+                    y = torch.tensor(vy[j * 256 : (j + 1) * 256], device=self.device, dtype=torch.float).reshape(-1)
+                    output = self.model(x, None).squeeze(1)
+                    if self.classification:
+                        probs = self.sigmoid(output)
+                        nll = -torch.log(probs) * y - torch.log(1 - probs) * (1 - y)
+                        loss = nll
+                        acc.append(((probs > 0.5) == y).sum())
+                    else:
+                        # regression
+                        loss = (output -  y).pow(2)
+                    vlosses.append(loss.sum().item())
+
+                test_loss = np.sum(vlosses) / len(vx)
+                test_losses.append(test_loss)
+                print('[fit proxy]', 'test_loss', test_loss, 'val_acc', (sum(acc) / len(vx)).item())
+                # self.args.logger.add_scalar("proxy_test_loss", test_loss)
+                if test_loss < best_loss:
+                    best_loss = test_loss
+                    best_params = [i.data.cpu().numpy() for i in self.model.parameters()]
+                    early_stop_count = 0
+                else:
+                    early_stop_count += 1
+
+                if early_stop_count >= early_stop_tol:
+                    print('(early stopping) early_stop_count', early_stop_count, 'best_loss', best_loss)
+                    break
+
+        if self.args.early_stop_to_best_params:
+            # Put best parameters back in
+            for i, besti in zip(self.model.parameters(), best_params):
+                i.data = torch.tensor(besti).to(self.device)
+        if self.args.save_path is not None:
+            self.save(self.args.save_path)
+        # self.args.logger.save(self.args.save_path, self.args)
+        return {}
+
+    def forward(self, curr_x, tok=None, uncertainty_call=False):
+        if curr_x is not None and tok is None:
+            x = str_to_tokens(curr_x, self.tokenizer).to(self.device).t()
+        else:
+            x = tok
+        if uncertainty_call:
+            ys = self.model(x, None).unsqueeze(0)
+        else:
+            self.model.eval()
+            ys = self.model(x, None)
+            self.model.train()
+        return ys
+    
+    # added by ling
+    def forward_for_intermediate_states(self, curr_x, tok=None, uncertainty_call=False, x_max_len=-1):
+        if curr_x is not None and tok is None:
+            # x = str_to_tokens_pad_max_len(curr_x, self.tokenizer, max_len=x_max_len).to(self.device).t()
+
+            curr_x = list(curr_x)
+            curr_x = [' ' * x_max_len] + curr_x
+            curr_x = np.array(curr_x)
+            # x_ = str_to_tokens(curr_x, self.tokenizer).to(self.device).t()
+            # x = copy.deepcopy(x_)[:, 1:]
+            x = str_to_tokens(curr_x, self.tokenizer).to(self.device).t()[:, 1:]
+
+            # to_pad_len = x_max_len - curr_x.shape[1]
+            # to_pad = self.all_to_pads[to_pad_len]
+            # for curr_x_idx in range(curr_x.shape[0]):
+            #     if curr_x[curr_x_idx][0] != 4:
+            #         to_pad[curr_x_idx][0] = 4
+            #     else:
+            #         to_pad[curr_x_idx][0] = 0
+            # x = torch.cat((curr_x, to_pad), -1)
+            # x = x.transpose(1, 0)
+
+            # to_pad = to_pad.cpu()
+            # torch.cuda.empty_cache()
+
+            # x = str_to_tokens(curr_x, self.tokenizer).to(self.device).t()
+            # print("1:{}".format(torch.cuda.memory_allocated(0)))
+        else:
+            x = tok
+        # padding_zeros = torch.zeros(x_max_len - x.shape[0], x.shape[1]).int().to(self.device)
+        # x = torch.cat((x, padding_zeros), 0)
+        if uncertainty_call:
+            ys = self.model(x, None).unsqueeze(0)
+        else:
+            self.model.eval()
+            ys = self.model(x, None)
+            self.model.train()
+            # padding_zeros = padding_zeros.cpu()
+            # x = x.cpu()
+            # torch.cuda.empty_cache()
+        return ys
+    # added by ling
+
+    def forward_with_uncertainty(self, x):
+        x = str_to_tokens(x, self.tokenizer).to(self.device).t()
+        self.model.train()
+        with torch.no_grad():
+            outputs = torch.cat([self.forward(None, x, True) for _ in range(self.args.proxy_num_dropout_samples)])
+        return outputs.mean(dim=0), outputs.std(dim=0)
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path):
+        self.load_state_dict(torch.load(path))
